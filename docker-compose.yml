@@ -7,6 +7,25 @@ services:
       POSTGRES_USER: demo
       POSTGRES_PASSWORD: demo
       POSTGRES_DB: demo_database
+    # Таймауты на уровне сервера намеренно НЕ выставлены: на демо сначала показываем проблему.
+    # Маленький max_connections — чтобы «too many clients» воспроизводился на ноутбуке.
+    command:
+      - postgres
+      - -c
+      - max_connections=50
+      - -c
+      - log_lock_waits=on
+      - -c
+      - deadlock_timeout=1s
+      - -c
+      - log_min_duration_statement=5000
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - log_temp_files=0
+    # Лимит памяти контейнера, как у пода в k8s.
+    mem_limit: 1g
+    memswap_limit: 1g   # без swap, как у пода в k8s
     ports:
       - "5432:5432"
     volumes:
@@ -16,6 +35,94 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: demo-database-pg-exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: "postgres:5432/demo_database?sslmode=disable&lock_timeout=1000&statement_timeout=5000"  # мониторинг не должен сам вставать в очередь блокировок
+      DATA_SOURCE_USER: demo
+      DATA_SOURCE_PASS: demo
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yaml
+    volumes:
+      - ./monitoring/postgres-exporter/queries.yaml:/etc/postgres-exporter/queries.yaml:ro
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: demo-database-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9090:9090"
+
+  # PgHero — http://localhost:8082
+  pghero:
+    image: ankane/pghero:latest
+    container_name: demo-database-pghero
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://demo:demo@postgres:5432/demo_database
+    ports:
+      - "8082:8080"
+    depends_on:
+      - postgres
+
+  # dasha (https://github.com/dbulashev/dasha) — альтернатива PgHero: http://localhost:3001
+  dasha-backend:
+    image: dbulashev/dasha-backend:latest
+    container_name: demo-database-dasha-backend
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/dasha/dasha.yaml:/etc/dasha/dasha.yaml:ro
+    depends_on:
+      - postgres
+
+  dasha-frontend:
+    image: dbulashev/dasha-frontend:latest
+    container_name: demo-database-dasha-frontend
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: dasha-backend:8000
+    ports:
+      - "3001:3000"
+    depends_on:
+      - dasha-backend
+
+  grafana-renderer:
+    image: grafana/grafana-image-renderer:latest
+    container_name: demo-database-grafana-renderer
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: demo-database-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/tx.json
+      # PNG-выгрузка панелей для слайдов: Share → Link → Direct link rendered image
+      GF_RENDERING_SERVER_URL: http://grafana-renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   pgdata:

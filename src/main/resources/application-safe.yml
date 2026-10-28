@@ -1,0 +1,95 @@
+# Профиль safe — прод-конфиг для этого стенда: «застывшие» транзакции не кладут сервис, а быстро отказывают.
+# В демо не нужен. Запуск с ним: Active profiles = safe (или --spring.profiles.active=safe).
+#
+# Паспорт стенда — из него посчитаны числа ниже (замер 2026-10-27):
+#   ноутбук           Apple M4: 10 ядер (4 P + 6 E), 24 ГБ; Docker Desktop: 10 CPU, 8 ГБ
+#   Postgres 16       контейнер 1 ГиБ, SSD, max_connections 50 (из них 3 — superuser_reserved_connections),
+#                     shared_buffers 128 МБ, work_mem 4 МБ, серверных таймаутов нет (все 0)
+#   транзакция        SELECT + UPDATE + COMMIT внутри базы — 0,13 мс, ~7800 tps (pgbench, 1 и 10 клиентов)
+#   новое соединение  0,7 мс (pgbench -C)
+#   TCP keepalive ОС  первая проба через 2 ч простоя (macOS net.inet.tcp.keepidle; в Linux-подах так же)
+#
+# Идея: у каждого ожидания есть верхняя граница, и каждая граница меньше следующей по цепочке:
+#   lock_timeout (2s) < statement_timeout (5s) < idle_in_transaction (10s) < leak detection (15s)
+#   < остановка приложения (20s) < socketTimeout (30s) < HTTP-таймаут клиента сервиса.
+# Время у Hikari — в миллисекундах, у драйвера pgJDBC — в секундах.
+spring:
+  datasource:
+    # Из окружения, не из git. Локально адрес подставляет docker compose.
+    # Кластер: jdbc:postgresql://pg-1,pg-2/db?targetServerType=primary — после failover драйвер найдёт новый мастер.
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/demo_database}
+    username: ${DB_USERNAME:demo}
+    password: ${DB_PASSWORD:demo}
+    hikari:
+      # Имя пула — в метриках (hikaricp_connections_*{pool="demo-pool"}), логах и JMX.
+      pool-name: demo-pool
+      # Размер пула — ограничитель нагрузки на базу, а не ускоритель. Не меньше потребности и не больше потолков:
+      #   потребность, закон Литтла: RPS к БД × время удержания × 1,5 на всплески
+      #     удержание: 0,13 мс в базе + 4 сетевых круга через Docker Desktop + Hibernate ≈ 2–3 мс, берём 5 мс
+      #     1000 rps × 5 мс × 1,5 = 7,5 → 8
+      #   потолок по базе: ядра × 2 + диски = 10 × 2 + 1 (SSD) = 21 — на ВСЕХ клиентов базы, не на один под
+      #   потолок по бюджету: (max_connections − резерв) / экземпляров сервиса = (50 − 10) / 2 = 20
+      #     резерв 10: 3 superuser + экспортер, PgHero, dasha, консоль IDEA;
+      #     экземпляров 2: при rolling update старый и новый живут одновременно (в проде — макс. подов HPA × 2)
+      #   память не ограничивает: backend ~10 МБ + work_mem 4 МБ → 50 соединений ≈ 0,7 ГБ из 1 ГиБ контейнера
+      # Берём 10: выше потребности, вдвое ниже потолков. Это 10 / 5 мс = 2000 транзакций в секунду.
+      # Проверка после запуска: p99 hikaricp_connections_usage должен быть в миллисекундах.
+      # Потребность выше потолка — не повод растить пул: соединение держат слишком долго (кейс из демо).
+      maximum-pool-size: 10
+      # minimum-idle не задаём: по умолчанию он равен maximum-pool-size, пул фиксированный (рекомендация HikariCP).
+      # Под пиком соединения не создаются, idle-timeout не нужен. Явная копия числа разойдётся с max при первой правке.
+      #
+      # Сколько поток ждёт свободное соединение. Дефолт 30 с — для API вечность: клиент уже ушёл, а потоки копятся.
+      # При удержании 5 мс пул за 3 с успевает выдать соединение ~6000 раз: не дождались — пул забит, ждать бесполезно.
+      # Для API 2–5 с и меньше таймаута, с которым ждут нас. Батчам — отдельный пул со своим таймаутом.
+      # От него же Hikari считает таймаут логина в драйвер: (3000 + 500) мс → 3 с.
+      connection-timeout: 3000
+      # isValid() перед выдачей, если соединение не трогали дольше 500 мс. Меньше connection-timeout.
+      # connection-test-query не задаём: для JDBC4-драйвера он только медленнее.
+      validation-timeout: 1000
+      # Возраст соединения; Hikari 7 случайно срезает его до 25 %, чтобы пул не обновлялся разом. Ограничивает:
+      #   — меньше самого короткого таймаута простоя по дороге (LB, NAT, firewall, пулер), иначе «Connection reset»;
+      #   — сколько пул пишет в старый мастер после failover;
+      #   — через сколько ALTER ROLE ... SET дойдёт до всех соединений.
+      # Пересоздание дешёвое (0,7 мс): 10 соединений раз в 10 мин — незаметно.
+      max-lifetime: 600000          # 10 мин
+      # Пинг простаивающих соединений, чтобы NAT и firewall их не забыли. Меньше max-lifetime и таймаутов простоя, ≥ 30 с.
+      keepalive-time: 120000        # 2 мин
+      # WARN «Apparent connection leak detected» со стеком того, кто держит соединение дольше порога. Не отбирает — диагностика.
+      # Нормальная транзакция держит миллисекунды. 15 с — больше idle_in_transaction (10 с): база такую уже оборвала бы,
+      # значит, соединение держит код, а не SQL. Низкий порог (3 с) шумит на каждую медленную, и лог перестают читать.
+      leak-detection-threshold: 15000
+      # MBean пула в JMX: active/idle/pending, размер можно поменять без рестарта.
+      register-mbeans: true
+      # auto-commit не трогаем: false на весь пул — и JdbcTemplate вне @Transactional молча теряет запись (Hikari откатит).
+      # Брать соединение при первом SQL, а не на входе в @Transactional: spring.datasource.connection-fetch: lazy (Boot 4.1+).
+      data-source-properties:
+        # pg_stat_activity.application_name: чьи это сессии — в dasha, PgHero и запросах к базе.
+        ApplicationName: ${spring.application.name}
+        # Таймауты на стороне Postgres — последний рубеж, работают даже при баге в коде.
+        # ВАЖНО: через PgBouncer/Odyssey в transaction mode параметр options не доходит до сервера.
+        # Там то же самое задаётся через ALTER ROLE ... SET (см. раздел «Таймауты» в докладе),
+        # а ещё нужен prepareThreshold: 0 (или PgBouncer 1.21+ с max_prepared_statements).
+        options: "-c statement_timeout=5000 -c lock_timeout=2000 -c idle_in_transaction_session_timeout=10000"
+        # TCP-подключение. Меньше таймаута логина (3 с): зависший хост не съедает всю попытку.
+        connectTimeout: 2
+        # Нет ответа от БД → соединение закрывается (failover, обрыв сети без RST). Больше statement_timeout,
+        # иначе драйвер оборвёт честный долгий запрос раньше базы.
+        socketTimeout: 30
+        # Пробы TCP от ОС: ловят мёртвый сокет, но первая — через 2 ч простоя (см. паспорт стенда).
+        # От NAT и firewall спасает keepalive-time выше.
+        tcpKeepAlive: true
+
+management:
+  metrics:
+    distribution:
+      # p99 ожидания и удержания соединения в Prometheus — для алертов и проверки «5 мс» из расчёта пула.
+      percentiles-histogram:
+        "[hikaricp.connections.acquire]": true
+        "[hikaricp.connections.usage]": true
+
+logging:
+  level:
+    # При старте Hikari печатает все параметры пула. Неверное значение он не отвергает:
+    # пишет WARN («is less than», «disabling it») и берёт дефолт — проверяйте лог.
+    com.zaxxer.hikari.HikariConfig: DEBUG

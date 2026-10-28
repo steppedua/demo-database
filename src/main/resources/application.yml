@@ -5,28 +5,24 @@ spring:
     compose:
       enabled: true
       file: docker-compose.yml
-      lifecycle-management: start-and-stop
+      # start-only: Grafana и Prometheus переживают рестарт приложения
+      lifecycle-management: start-only
+  datasource:
+    hikari:
+      pool-name: demo-pool            # hikaricp_connections_*{pool="demo-pool"} и логи
+      maximum-pool-size: 10           # дефолт
+      connection-timeout: 30000       # дефолт: столько поток ждёт соединение, потом «Connection is not available»
+      data-source-properties:
+        ApplicationName: demo-database   # pg_stat_activity.application_name: так сессии сервиса видны в Grafana и dasha
   jpa:
-    open-in-view: false
+    open-in-view: false # решение проблемы неочевидного n+1
     hibernate:
       ddl-auto: validate
-    properties:
-      hibernate:
-        format_sql: true
-    show-sql: true
   liquibase:
-    enabled: true
     change-log: classpath:db/changelog/db.changelog-master.yaml
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,mappings,beans,env
-  endpoint:
-    health:
-      show-details: always
-
-logging:
-  level:
-    org.hibernate.SQL: debug
+        include: '*'
