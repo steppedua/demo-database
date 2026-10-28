@@ -4,7 +4,18 @@
 
 ## Подготовка стенда
 
-Всё ниже воспроизводится на локальном Postgres 14+. Часть вещей требует расширений:
+Всё ниже воспроизводится на локальном Postgres 14+. Подойдёт и Postgres стенда `demo-database` (поднимается вместе
+с приложением, см. `cases/tx/README.md`). Сессия psql к нему — в отдельном окне терминала на каждую `S1`/`S2`/`S3`:
+
+```sh
+docker exec -it demo-database-postgres psql -U demo -d demo_database
+```
+
+На стенде миграции уже создали `pageinspect`, `pgstattuple`, `pg_visibility` и таблицы `acc`, `doctors`:
+шаги `CREATE TABLE` ниже пропустить. Демо с пулом списывает деньги со счёта 1, поэтому перед экспериментами
+вернуть исходный баланс: `UPDATE acc SET balance = 100 WHERE id = 1;`.
+
+Часть вещей требует расширений:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pageinspect;   -- смотреть страницы «как есть»
