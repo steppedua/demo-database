@@ -1,0 +1,90 @@
+# Дополнительные метрики для доклада про «застывшие» транзакции.
+# Встроенного pg_stat_activity_count мало: там нет wait_event_type, application_name и возраста транзакции.
+
+pg_sessions:
+  query: |
+    SELECT coalesce(nullif(application_name, ''), 'unknown') AS application_name,
+           coalesce(state, 'unknown')                         AS state,
+           coalesce(wait_event_type, 'none')                  AS wait_event_type,
+           count(*)                                           AS count,
+           coalesce(max(extract(epoch FROM now() - xact_start)), 0)   AS max_xact_age_seconds,
+           coalesce(max(extract(epoch FROM now() - state_change)), 0) AS max_state_age_seconds
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+      AND pid <> pg_backend_pid()
+    GROUP BY 1, 2, 3
+  metrics:
+    - application_name:
+        usage: LABEL
+        description: application_name клиента (ApplicationName в JDBC URL)
+    - state:
+        usage: LABEL
+        description: active / idle / idle in transaction / idle in transaction (aborted)
+    - wait_event_type:
+        usage: LABEL
+        description: Lock, Client, IO, ... или none
+    - count:
+        usage: GAUGE
+        description: Число клиентских сессий
+    - max_xact_age_seconds:
+        usage: GAUGE
+        description: Возраст самой старой транзакции в группе, с
+    - max_state_age_seconds:
+        usage: GAUGE
+        description: Сколько самая «залипшая» сессия находится в текущем state, с
+
+# Топ-10 самых старых открытых транзакций — для таблицы «что висит прямо сейчас».
+# В проде осторожно: query в лейбле = высокая кардинальность. Для демо ограничиваем 10 строками.
+pg_oldest_xact:
+  query: |
+    SELECT pid::text AS pid,
+           coalesce(nullif(application_name, ''), 'unknown') AS application_name,
+           coalesce(state, 'unknown') AS state,
+           coalesce(wait_event_type, 'none') AS wait_event_type,
+           left(regexp_replace(coalesce(query, ''), '\s+', ' ', 'g'), 70) AS query,
+           extract(epoch FROM now() - xact_start) AS age_seconds
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+      AND xact_start IS NOT NULL
+      AND pid <> pg_backend_pid()
+      AND now() - xact_start > interval '1 second'
+    ORDER BY xact_start
+    LIMIT 10
+  metrics:
+    - pid: {usage: LABEL, description: pid backend'а}
+    - application_name: {usage: LABEL, description: application_name}
+    - state: {usage: LABEL, description: state}
+    - wait_event_type: {usage: LABEL, description: wait_event_type}
+    - query: {usage: LABEL, description: последний запрос (обрезан)}
+    - age_seconds: {usage: GAUGE, description: now() - xact_start, с}
+
+# CPU, память и диск контейнера Postgres — из его cgroup v2, как у пода в k8s.
+# postgres-exporter таких метрик не отдаёт, а cAdvisor на Docker Desktop с containerd-хранилищем образов
+# не сопоставляет cgroup с контейнером. pg_read_file нужен суперпользователь или роль pg_read_server_files.
+pg_container:
+  query: |
+    WITH f AS (
+      SELECT pg_read_file('/sys/fs/cgroup/cpu.stat', true)       AS cpu,
+             pg_read_file('/sys/fs/cgroup/memory.current', true) AS mem_cur,
+             pg_read_file('/sys/fs/cgroup/memory.max', true)     AS mem_max,
+             pg_read_file('/sys/fs/cgroup/memory.stat', true)    AS mem_stat,
+             pg_read_file('/sys/fs/cgroup/io.stat', true)        AS io
+    )
+    SELECT (regexp_match(cpu, 'usage_usec (\d+)'))[1]::float8 / 1e6     AS cpu_seconds_total,
+           (regexp_match(cpu, 'throttled_usec (\d+)'))[1]::float8 / 1e6 AS cpu_throttled_seconds_total,
+           trim(mem_cur)::float8                                        AS memory_usage_bytes,
+           trim(mem_cur)::float8
+             - coalesce((regexp_match(mem_stat, 'inactive_file (\d+)'))[1]::float8, 0) AS memory_working_set_bytes,
+           CASE WHEN btrim(mem_max, E' \n') ~ '^\d+$' THEN btrim(mem_max, E' \n')::float8 ELSE 'NaN' END AS memory_limit_bytes,
+           coalesce((SELECT sum(m[1]::float8) FROM regexp_matches(io, 'rbytes=(\d+)', 'g') AS m), 0) AS io_read_bytes_total,
+           coalesce((SELECT sum(m[1]::float8) FROM regexp_matches(io, 'wbytes=(\d+)', 'g') AS m), 0) AS io_write_bytes_total
+    FROM f
+    WHERE cpu IS NOT NULL
+  metrics:
+    - cpu_seconds_total: {usage: COUNTER, description: "CPU контейнера Postgres, с (cpu.stat usage_usec)"}
+    - cpu_throttled_seconds_total: {usage: COUNTER, description: "Сколько контейнер простоял из-за CPU-лимита, с"}
+    - memory_usage_bytes: {usage: GAUGE, description: "memory.current, включая page cache"}
+    - memory_working_set_bytes: {usage: GAUGE, description: "memory.current - inactive_file: по нему OOM killer и kubectl top"}
+    - memory_limit_bytes: {usage: GAUGE, description: "memory.max (mem_limit в compose), NaN — без лимита"}
+    - io_read_bytes_total: {usage: COUNTER, description: "Прочитано с диска, байт (io.stat)"}
+    - io_write_bytes_total: {usage: COUNTER, description: "Записано на диск, байт (io.stat)"}

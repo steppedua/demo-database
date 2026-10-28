@@ -1,0 +1,11 @@
+# dasha — веб-диагностика PostgreSQL (https://github.com/dbulashev/dasha): альтернатива PgHero.
+# В проде — отдельная роль с GRANT pg_monitor, а не суперпользователь приложения.
+clusters:
+  - name: demo
+    username: demo
+    password: demo
+    port: 5432
+    databases:
+      - demo_database
+    hosts:
+      - postgres

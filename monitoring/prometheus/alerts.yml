@@ -1,0 +1,33 @@
+# Четыре алерта на «застывшие» транзакции. Пороги `for:` для демо короче боевых (в комментарии — прод).
+groups:
+  - name: frozen-transactions
+    rules:
+      - alert: HikariPoolPending
+        # Потоки стоят в очереди за соединением — пул исчерпан.
+        expr: max by (instance, pool) (hikaricp_connections_pending) > 0
+        for: 15s   # прод: 1m — короткие всплески pending бывают и в норме
+        labels: { severity: warning }
+        annotations:
+          summary: "Пул {{ $labels.pool }}: {{ $value }} потоков ждут соединение"
+
+      - alert: HikariConnectionTimeouts
+        # Пользователи уже получают «Connection is not available, request timed out».
+        expr: sum by (instance, pool) (increase(hikaricp_connections_timeout_total[1m])) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Пул {{ $labels.pool }}: таймауты получения соединения"
+
+      - alert: PgIdleInTransaction
+        # Транзакция открыта, а приложение занято другим. Виноват код.
+        expr: max(pg_sessions_max_state_age_seconds{state=~"idle in transaction.*"}) > 10
+        for: 10s   # прод: порог 60s, for 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Сессия висит в idle in transaction {{ $value | humanizeDuration }}"
+
+      - alert: PgLongTransaction
+        expr: max(pg_sessions_max_xact_age_seconds) > 15
+        for: 10s   # прод: порог 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Транзакция открыта {{ $value | humanizeDuration }}"
